@@ -65,18 +65,21 @@ jobs:
       # ================================================================
       - name: Setup GitHub CLI and determine fork repo
         id: setup
+        # GH_TOKEN 必须用 step env 注入（GITHUB_ENV 在同一步骤中不可用）
+        env:
+          GH_TOKEN: ${{ secrets.FORK_TOKEN }}
         run: |
-          # 设置 GH_TOKEN 供后续 gh 命令使用
-          echo "GH_TOKEN=${{ secrets.FORK_TOKEN }}" >> $GITHUB_ENV
-
           # 获取当前 token 对应的 GitHub 用户名
           WHOAMI=$(gh api user --jq '.login')
           echo "Authenticated as: $WHOAMI"
 
-          # 直接输出 fork_repo 到 step outputs
+          # 输出 fork_repo 到 step outputs
           FORK_REPO="$WHOAMI/${{ env.UPSTREAM_REPO }}"
           echo "fork_repo=$FORK_REPO" >> $GITHUB_OUTPUT
           echo "✅ Fork repo: $FORK_REPO"
+
+          # 同时写入 GITHUB_ENV，供后续步骤使用
+          echo "GH_TOKEN=${{ secrets.FORK_TOKEN }}" >> $GITHUB_ENV
 
       # ================================================================
       # 3. 检查 fork 是否已存在
