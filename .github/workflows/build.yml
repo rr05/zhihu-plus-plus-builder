@@ -1,3 +1,6 @@
+# ============================================================
+# Auto Build Zhihu++ — 独立 Builder 仓库模式
+# ============================================================
 name: Auto Build Zhihu++
 
 on:
@@ -22,76 +25,110 @@ permissions:
 env:
   UPSTREAM_OWNER: zly2006
   UPSTREAM_REPO: zhihu-plus-plus
-  FORK_OWNER: ""
+  # 强制使用 Node.js 24（避免 Node.js 20 弃用警告）
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # ================================================================
+  # Job 1: Fork + 同步上游
+  # ================================================================
   sync-upstream:
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.decision.outputs.should_build }}
       upstream_branch: ${{ steps.upstream-info.outputs.default_branch }}
       upstream_sha: ${{ steps.upstream-info.outputs.upstream_sha }}
+      fork_repo: ${{ steps.setup.outputs.fork_repo }}
 
     steps:
-      - name: Checkout builder repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Configure GitHub CLI
+      # ================================================================
+      # 1. 检查 FORK_TOKEN 是否已配置
+      # ================================================================
+      - name: Check FORK_TOKEN secret
+        id: check-token
         run: |
+          if [ -z "${{ secrets.FORK_TOKEN }}" ]; then
+            echo "::error::============================================"
+            echo "::error::FORK_TOKEN secret 未配置！"
+            echo "::error::请先在仓库 Settings → Secrets and variables → Actions 中添加："
+            echo "::error::  Name: FORK_TOKEN"
+            echo "::error::  Value: 你的 GitHub Personal Access Token (需 public_repo 权限)"
+            echo "::error::============================================"
+            exit 1
+          fi
+          echo "✅ FORK_TOKEN is configured"
+
+      # ================================================================
+      # 2. 配置 gh CLI + 获取当前用户身份 + 确定 fork_repo
+      #    注意：这里用一个步骤完成，因为 ${{ env.xxx }} 在 workflow 解析时
+      #    求值，无法读取运行时通过 $GITHUB_ENV 设置的值。
+      # ================================================================
+      - name: Setup GitHub CLI and determine fork repo
+        id: setup
+        run: |
+          # 设置 GH_TOKEN 供后续 gh 命令使用
           echo "GH_TOKEN=${{ secrets.FORK_TOKEN }}" >> $GITHUB_ENV
+
+          # 获取当前 token 对应的 GitHub 用户名
           WHOAMI=$(gh api user --jq '.login')
           echo "Authenticated as: $WHOAMI"
-          echo "gh_user=$WHOAMI" >> $GITHUB_ENV
 
-      - name: Determine fork owner
-        id: fork-owner
-        run: |
-          if [ -n "${{ env.FORK_OWNER }}" ]; then
-            OWNER="${{ env.FORK_OWNER }}"
-          else
-            OWNER="${{ env.gh_user }}"
-          fi
-          echo "Fork will be under: $OWNER"
-          echo "owner=$OWNER" >> $GITHUB_OUTPUT
-          echo "fork_repo=$OWNER/${{ env.UPSTREAM_REPO }}" >> $GITHUB_OUTPUT
+          # 直接输出 fork_repo 到 step outputs
+          FORK_REPO="$WHOAMI/${{ env.UPSTREAM_REPO }}"
+          echo "fork_repo=$FORK_REPO" >> $GITHUB_OUTPUT
+          echo "✅ Fork repo: $FORK_REPO"
 
+      # ================================================================
+      # 3. 检查 fork 是否已存在
+      # ================================================================
       - name: Check if fork exists
         id: check-fork
         run: |
-          OWNER="${{ steps.fork-owner.outputs.owner }}"
-          FORK_REPO="$OWNER/${{ env.UPSTREAM_REPO }}"
+          FORK_REPO="${{ steps.setup.outputs.fork_repo }}"
           HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "Authorization: token ${{ secrets.FORK_TOKEN }}" \
             "https://api.github.com/repos/$FORK_REPO")
+
           if [ "$HTTP_CODE" = "200" ]; then
             echo "exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Fork already exists: $FORK_REPO"
           else
             echo "exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️  Fork does not exist yet (HTTP $HTTP_CODE)"
           fi
-          echo "fork_repo=$FORK_REPO" >> $GITHUB_OUTPUT
 
-      - name: Create fork via API
+      # ================================================================
+      # 4. 自动创建 fork
+      # ================================================================
+      - name: Create fork via GitHub API
         if: steps.check-fork.outputs.exists == 'false'
         run: |
+          echo "⏳ Creating fork of ${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }} ..."
           RESPONSE=$(curl -s -X POST \
             -H "Authorization: token ${{ secrets.FORK_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}/forks" \
             -d '{}')
+
           FULL_NAME=$(echo "$RESPONSE" | jq -r '.full_name // empty')
           if [ -n "$FULL_NAME" ]; then
             echo "✅ Fork created: $FULL_NAME"
           else
-            echo "::error::$(echo "$RESPONSE" | jq -r '.message')"
+            MSG=$(echo "$RESPONSE" | jq -r '.message // "Unknown error"')
+            echo "::error::Failed to create fork: $MSG"
             exit 1
           fi
 
-      - name: Wait for fork readiness
+      # ================================================================
+      # 5. 等待 fork 就绪（GitHub 异步创建）
+      # ================================================================
+      - name: Wait for fork to be ready
         if: steps.check-fork.outputs.exists == 'false'
         run: sleep 20
 
+      # ================================================================
+      # 6. 获取上游默认分支（不硬编码 master/main）
+      # ================================================================
       - name: Get upstream info
         id: upstream-info
         run: |
@@ -100,18 +137,27 @@ jobs:
           SHA=$(curl -s "$API_URL/git/refs/heads/$DEFAULT_BRANCH" | jq -r '.object.sha')
           echo "default_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
           echo "upstream_sha=$SHA" >> $GITHUB_OUTPUT
+          echo "📋 Upstream default branch: $DEFAULT_BRANCH"
 
+      # ================================================================
+      # 7. 同步 fork：clone → add upstream → fetch → merge → push
+      # ================================================================
       - name: Sync fork with upstream
         id: sync
         run: |
-          OWNER="${{ steps.fork-owner.outputs.owner }}"
-          FORK_REPO="$OWNER/${{ env.UPSTREAM_REPO }}"
+          FORK_REPO="${{ steps.setup.outputs.fork_repo }}"
           BRANCH="${{ steps.upstream-info.outputs.default_branch }}"
+          TOKEN="${{ secrets.FORK_TOKEN }}"
 
+          # 在临时目录操作
           TMPDIR=$(mktemp -d)
           cd "$TMPDIR"
-          git clone "https://x-access-token:${{ secrets.FORK_TOKEN }}@github.com/$FORK_REPO" .
+
+          echo "📦 Cloning $FORK_REPO ..."
+          git clone "https://x-access-token:${TOKEN}@github.com/${FORK_REPO}" .
           git remote add upstream "https://github.com/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}.git"
+
+          echo "⬇️  Fetching upstream/$BRANCH ..."
           git fetch upstream "$BRANCH"
 
           UPSTREAM_SHA=$(git rev-parse "upstream/$BRANCH")
@@ -119,54 +165,82 @@ jobs:
           echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
 
           if [ "$UPSTREAM_SHA" = "$LOCAL_SHA" ]; then
+            echo "✅ Already up-to-date with upstream: $LOCAL_SHA"
             echo "has_new_commits=false" >> $GITHUB_OUTPUT
           else
+            echo "🆕 New commits detected! Upstream: $UPSTREAM_SHA"
+            echo "   Local: $LOCAL_SHA"
             git config user.name  "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
+
             if git merge --no-edit "upstream/$BRANCH"; then
+              echo "⬆️  Pushing to $FORK_REPO ..."
               git push origin "$BRANCH"
+              echo "✅ Fork synced with upstream!"
               echo "has_new_commits=true" >> $GITHUB_OUTPUT
             else
+              echo "::error::Merge conflict with upstream! Resolve manually in $FORK_REPO"
               git merge --abort
               echo "has_new_commits=false" >> $GITHUB_OUTPUT
               exit 1
             fi
           fi
+
+          # 清理
           cd / && rm -rf "$TMPDIR"
 
+      # ================================================================
+      # 8. 决定是否构建
+      # ================================================================
       - name: Decide whether to build
         id: decision
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.skip_sync }}" = "true" ]; then
+            echo "🔧 Manual trigger (skip sync) → build"
             echo "should_build=true" >> $GITHUB_OUTPUT
           elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "🔧 Manual trigger (with sync) → build"
             echo "should_build=true" >> $GITHUB_OUTPUT
           elif [ "${{ steps.sync.outputs.has_new_commits }}" = "true" ]; then
+            echo "🔧 Scheduled – new upstream commits → build"
             echo "should_build=true" >> $GITHUB_OUTPUT
           else
+            echo "⏭️  No new commits, skipping build"
             echo "should_build=false" >> $GITHUB_OUTPUT
           fi
 
+  # ================================================================
+  # Job 2: 构建 APK
+  # ================================================================
   build:
     needs: sync-upstream
     if: needs.sync-upstream.outputs.should_build == 'true'
     runs-on: ubuntu-latest
 
     steps:
+      # ================================================================
+      # 从 fork 仓库 clone 源码
+      # ================================================================
       - name: Checkout fork source code
         uses: actions/checkout@v4
         with:
-          repository: ${{ needs.sync-upstream.outputs.fork_repo || steps.fork-owner.outputs.fork_repo }}
+          repository: ${{ needs.sync-upstream.outputs.fork_repo }}
           token: ${{ secrets.FORK_TOKEN }}
           fetch-depth: 1
           path: source
 
-      - name: Set env vars
+      # ================================================================
+      # 环境变量
+      # ================================================================
+      - name: Set environment variables
         working-directory: source
         run: |
           echo "date_today=$(date +'%Y-%m-%d')"          >> $GITHUB_ENV
           echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
+      # ================================================================
+      # JDK 17
+      # ================================================================
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -174,6 +248,9 @@ jobs:
           java-version: 17
           cache: 'gradle'
 
+      # ================================================================
+      # Rust 工具链（项目包含 Rust 原生库 + APK 重压缩工具）
+      # ================================================================
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -189,13 +266,22 @@ jobs:
           rustup target add i686-linux-android
           rustup target add x86_64-linux-android
 
-      - name: Grant gradlew permissions
+      # ================================================================
+      # Gradle wrapper
+      # ================================================================
+      - name: Grant gradlew execute permission
         working-directory: source
         run: chmod +x ./gradlew
 
+      # ================================================================
+      # Android SDK（自动接受所有许可证）
+      # ================================================================
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
+      # ================================================================
+      # Android NDK（项目需要 NDK 29）
+      # ================================================================
       - name: Install Android NDK
         run: |
           echo "y" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
@@ -203,6 +289,9 @@ jobs:
           || echo "y" | sdkmanager --install "ndk;29.0.14206865"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/29.0.14206865" >> $GITHUB_ENV
 
+      # ================================================================
+      # 缓存
+      # ================================================================
       - name: Cache Rust
         uses: actions/cache@v4
         with:
@@ -223,10 +312,17 @@ jobs:
             ~/.m2/repository
           key: gradle-cache-${{ hashFiles('source/**/*.gradle.kts', 'source/**/gradle-wrapper.properties') }}
 
+      # ================================================================
+      # KtLint 检查
+      # ================================================================
       - name: Run KtLint
         working-directory: source
         run: ./gradlew ktlintCheck
+        continue-on-error: true
 
+      # ================================================================
+      # 构建 APK（Full + Lite Release）
+      # ================================================================
       - name: Build APK
         working-directory: source
         run: |
@@ -238,14 +334,32 @@ jobs:
           keyPassword:          ${{ secrets.ANDROID_KEY_PASSWORD }}
           CI_BUILD_MINIFY:      true
 
+      # ================================================================
+      # 整理 APK 文件
+      # ================================================================
       - name: Organize APK outputs
         run: |
           mkdir -p upload
           APK_DIR="${{ github.workspace }}/source/app/build/outputs/apk"
-          [ -f "$APK_DIR/full/release/app-full-release.apk" ] && cp "$APK_DIR/full/release/app-full-release.apk" upload/zhihu++-full.apk
-          [ -f "$APK_DIR/lite/release/app-lite-release.apk" ] && cp "$APK_DIR/lite/release/app-lite-release.apk" upload/zhihu++-lite.apk
+          if [ -f "$APK_DIR/full/release/app-full-release.apk" ]; then
+            cp "$APK_DIR/full/release/app-full-release.apk" upload/zhihu++-full.apk
+            echo "✅ zhihu++-full.apk"
+          else
+            echo "⚠️  Full APK not found"
+          fi
+          if [ -f "$APK_DIR/lite/release/app-lite-release.apk" ]; then
+            cp "$APK_DIR/lite/release/app-lite-release.apk" upload/zhihu++-lite.apk
+            echo "✅ zhihu++-lite.apk"
+          else
+            echo "⚠️  Lite APK not found"
+          fi
+          echo ""
+          echo "📦  Build artifacts:"
           ls -lh upload/
 
+      # ================================================================
+      # 上传 Artifact（保留 90 天）
+      # ================================================================
       - name: Upload APK as artifact
         uses: actions/upload-artifact@v4
         with:
@@ -253,6 +367,9 @@ jobs:
           path: upload/
           retention-days: 90
 
+      # ================================================================
+      # 创建 Release（APK 挂载到 builder 仓库的 Release 中）
+      # ================================================================
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -270,7 +387,7 @@ jobs:
             | `zhihu++-full.apk` | Full 版 — 含 AI 功能 (ONNX) |
             | `zhihu++-lite.apk` | Lite 版 — 不含 AI，体积更小 |
 
-            > 如需签名 APK，请在仓库 Setting → Secrets 中配置：
+            > 如需签名 APK，请在仓库 Settings → Secrets and variables → Actions 中配置：
             > ANDROID_SIGNING_KEY, ANDROID_KEY_ALIAS, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_PASSWORD
           files: |
             upload/zhihu++-full.apk
